@@ -1,0 +1,217 @@
+server:
+  # Force HTTPS in production behind a reverse proxy (nginx/ALB)
+  forward-headers-strategy: framework
+
+spring:
+  application:
+    name: bff-gateway
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # REDIS SESSION STORAGE
+  # Tokens are stored in Redis, never sent to the browser.
+  # The browser only receives a SESSION cookie (HTTP-only, Secure).
+  # ─────────────────────────────────────────────────────────────────────────────
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:secret}
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 10
+          max-idle: 5
+          min-idle: 2
+
+  session:
+    store-type: redis
+    redis:
+      namespace: openclaw:session
+    timeout: 30m   # Session expires after 30 min of inactivity
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # OAUTH2 CLIENT — Keycloak Authorization Code Flow
+  #
+  # WHY AUTHORIZATION CODE FLOW?
+  # - The browser is redirected to Keycloak for login
+  # - Keycloak sends back an authorization CODE (not a token) to the gateway
+  # - The gateway exchanges the code for tokens SERVER-SIDE
+  # - Tokens NEVER touch the browser
+  # ─────────────────────────────────────────────────────────────────────────────
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            provider: keycloak
+            client-id: cashier-1-client
+            client-secret: ${KEYCLOAK_CLIENT_SECRET:aUOzaSyVPd3U1CQzhK3hpaIRGXOB3MtJ}
+            authorization-grant-type: authorization_code
+            # openid  → enables ID token (user identity)
+            # profile → username, full name
+            # email   → email address
+            # roles   → Keycloak realm/client roles mapped to Spring Security authorities
+            scope: openid,profile,email,roles
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+        provider:
+          keycloak:
+            issuer-uri: https://ppusso.devoutsys.com/realms/los-realm
+            # preferred_username is the login name in Keycloak
+            user-name-attribute: preferred_username
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # SPRING CLOUD GATEWAY ROUTES
+  #
+  # TokenRelay= filter: reads the stored OAuth2 access token from the server-side
+  # session and injects it as "Authorization: Bearer <token>" on every proxied request.
+  # The frontend NEVER touches this token.
+  # ─────────────────────────────────────────────────────────────────────────────
+  cloud:
+     gateway:
+      # Automatically add X-Forwarded-* headers so downstream services
+      # generate correct redirect URLs (use gateway host:port, not their own).
+      x-forwarded:
+        for-enabled: true
+        host-enabled: true
+        port-enabled: true
+        proto-enabled: true
+        prefix-enabled: true
+
+      server:
+        webflux:
+          default-filters:
+            # Automatically relay Bearer token to every downstream service
+            - TokenRelay=
+            # Remove the Authorization header (TokenRelay adds it back with the token)
+            - RemoveRequestHeader=Authorization
+            # Add correlation ID for distributed tracing
+            - AddRequestHeader=X-Gateway-Source, bff-gateway
+
+          routes:
+            # ════════════════════════════════════════════════════════════════════
+            # STARTER / DEMO DOWNSTREAM SERVICES
+            # ════════════════════════════════════════════════════════════════════
+
+            # ── HELLO REST API (port 8081) ────────────────────────────────────────
+            - id: hello-rest-api
+              uri: ${HELLO_API_URI:http://localhost:8081}
+              predicates:
+                - Path=/api/hello/**
+              filters:
+                - StripPrefix=0
+                - RemoveRequestHeader=Cookie
+
+            # ── VAADIN SESSION DASHBOARD (port 8082) ─────────────────────────────
+            # Proxies /vaadin/** to Vaadin app at localhost:8082/vaadin/**.
+            # Cookie header is PRESERVED (no RemoveRequestHeader=Cookie) — Vaadin
+            # needs its own HTTP session for Push/websocket.
+            - id: vaadin-app
+              uri: ${VAADIN_APP_URI:http://localhost:8082}
+              predicates:
+                - Path=/vaadin/**
+              filters:
+                - TokenRelay=
+                - AddRequestHeader=X-Gateway-Source, bff-gateway
+                # Rewrite any 302 Location headers pointing to the downstream
+                # back to the gateway, so the browser stays on localhost:8080.
+                - RewriteResponseHeader=Location, http://localhost:8082/, http://localhost:8080/
+
+            # ════════════════════════════════════════════════════════════════════
+            # BUSINESS MICROSERVICES (placeholders)
+            # ════════════════════════════════════════════════════════════════════
+
+            # ── CASHIER SERVICE ──────────────────────────────────────────────────
+            - id: cashier-service
+              uri: ${CASHIER_SERVICE_URI:http://localhost:9091}
+              predicates:
+                - Path=/api/cashier/**
+              filters:
+                - StripPrefix=0
+                - RemoveRequestHeader=Cookie
+                - name: CircuitBreaker
+                  args:
+                    name: cashierCircuitBreaker
+                    fallbackUri: forward:/fallback/cashier
+
+            # ── PRODUCTS SERVICE ─────────────────────────────────────────────────
+            - id: products-service
+              uri: ${PRODUCTS_SERVICE_URI:http://localhost:9092}
+              predicates:
+                - Path=/api/products/**
+              filters:
+                - StripPrefix=0
+                - RemoveRequestHeader=Cookie
+
+            # ── ORDERS SERVICE ───────────────────────────────────────────────────
+            - id: orders-service
+              uri: ${ORDERS_SERVICE_URI:http://localhost:9093}
+              predicates:
+                - Path=/api/orders/**
+              filters:
+                - StripPrefix=0
+                - RemoveRequestHeader=Cookie
+
+            # ── ADMIN SERVICE (restricted to ROLE_admin) ─────────────────────────
+            - id: admin-service
+              uri: ${ADMIN_SERVICE_URI:http://localhost:9094}
+              predicates:
+                - Path=/api/admin/**
+              filters:
+                - StripPrefix=0
+                - RemoveRequestHeader=Cookie
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ACTUATOR — expose only safe endpoints
+# ─────────────────────────────────────────────────────────────────────────────
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: when-authorized
+  info:
+    env:
+      enabled: true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING — structured JSON in production
+# ─────────────────────────────────────────────────────────────────────────────
+logging:
+  level:
+    root: INFO
+    com.openclaw: DEBUG
+    org.springframework.security: INFO
+    org.springframework.cloud.gateway: INFO
+    # Enable for OAuth2 debugging (disable in production)
+    org.springframework.security.oauth2: ${OAUTH2_LOG_LEVEL:WARN}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CUSTOM APP PROPERTIES
+# ─────────────────────────────────────────────────────────────────────────────
+app:
+  security:
+    # Paths that do NOT require authentication
+    public-paths:
+      - /actuator/health
+      - /actuator/info
+      - /login
+      - /oauth2/**
+      - /fallback/**
+      - /error
+    # After logout, where to send the user
+    post-logout-redirect-uri: ${APP_BASE_URL:http://localhost:8080}/login
+    # The base URL of this gateway (used for Keycloak logout redirect)
+    base-url: ${APP_BASE_URL:http://localhost:8080}
+    # Set to true when serving over HTTPS (production), false for HTTP dev
+    secure-cookie: ${SECURE_COOKIE:false}
+    # SameSite attribute on the session cookie.
+    # "Lax" (default) — sent on top-level GET navigations (works for OAuth2 redirect back from Keycloak).
+    # "None" — sent on all cross-site requests (requires secure-cookie=true and HTTPS).
+    # "" (empty) — browser default (effectively Lax in modern browsers).
+    # In dev, if you get "authorization_request_not_found" after Keycloak login,
+    # try setting this to empty (SAME_SITE_COOKIE=) in your .env file.
+    same-site-cookie: ${SAME_SITE_COOKIE:Lax}
+
+
